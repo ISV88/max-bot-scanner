@@ -1,0 +1,9 @@
+{
+  "name": "max-bot-vercel",
+  "private": true,
+  "description": "MAX webhook proxy with DataMatrix decode",
+  "dependencies": {
+    "sharp": "latest",
+    "zxing-wasm": "^3.0.1"
+  }
+}
