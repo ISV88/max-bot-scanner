@@ -2,8 +2,11 @@
   "name": "max-bot-vercel",
   "private": true,
   "description": "MAX webhook proxy with DataMatrix decode",
+  "scripts": {
+    "postinstall": "node scripts/copy-zxing-wasm.mjs"
+  },
   "dependencies": {
-    "sharp": "latest",
-    "zxing-wasm": "^3.0.1"
+    "sharp": "0.33.5",
+    "zxing-wasm": "3.0.1"
   }
 }

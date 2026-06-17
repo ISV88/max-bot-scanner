@@ -103,9 +103,27 @@ function getUpdateList(bodyObj) {
   return [];
 }
 
-function isEmptyMessageText(update) {
+function isDecodeMarkerText(text) {
+  const value = String(text || "");
+  return (
+    value === DECODE_FAILED_MARKER ||
+    value.startsWith(`${DECODE_FAILED_MARKER}:`) ||
+    value.startsWith(DECODE_NON_DM_PREFIX)
+  );
+}
+
+function shouldDecodePhotoMessage(update) {
+  if (update?.update_type !== "message_created") {
+    return false;
+  }
+  if (!getImageAttachment(update)) {
+    return false;
+  }
   const text = update?.message?.body?.text;
-  return typeof text !== "string" || text.trim() === "";
+  if (typeof text !== "string" || text.trim() === "") {
+    return true;
+  }
+  return isDecodeMarkerText(text);
 }
 
 function getImageAttachment(update) {
@@ -114,43 +132,136 @@ function getImageAttachment(update) {
     return null;
   }
   for (const item of attachments) {
-    if (item?.type === "image" && item?.payload?.url) {
-      return item.payload;
+    if (item?.type !== "image" || !item?.payload) {
+      continue;
+    }
+    const payload = { ...item.payload };
+    if (!payload.url) {
+      if (Array.isArray(payload.ls) && payload.ls[0]) {
+        payload.url = payload.ls[0];
+      } else if (typeof payload.ls === "string" && payload.ls) {
+        payload.url = payload.ls;
+      }
+    }
+    if (payload.url) {
+      return payload;
     }
   }
   return null;
 }
 
 function withTokenIfNeeded(url, token) {
-  if (!token) {
-    return url;
-  }
-  if (url.includes("token=")) {
+  if (!token || url.includes("token=")) {
     return url;
   }
   const sep = url.includes("?") ? "&" : "?";
   return `${url}${sep}token=${encodeURIComponent(token)}`;
 }
 
-async function decodeImageFromAttachment(payload) {
-  const imageUrl = withTokenIfNeeded(payload.url, payload.token);
-  const imageResponse = await fetch(imageUrl);
-  if (!imageResponse.ok) {
-    return { ok: false, error: `image_fetch_${imageResponse.status}` };
+function buildImageFetchUrls(payload) {
+  const urls = [];
+  const candidates = [payload?.url];
+  if (Array.isArray(payload?.ls)) {
+    candidates.push(...payload.ls);
+  } else if (typeof payload?.ls === "string") {
+    candidates.push(payload.ls);
   }
-  const imageBytes = await imageResponse.arrayBuffer();
-  const contentType = imageResponse.headers.get("content-type") || "";
+
+  for (const candidate of candidates) {
+    if (!candidate) {
+      continue;
+    }
+    const base = String(candidate);
+    urls.push(base);
+    if (payload?.token) {
+      urls.push(withTokenIfNeeded(base, payload.token));
+    }
+  }
+
+  return [...new Set(urls)];
+}
+
+function getImageFetchHeaders() {
+  const headers = {
+    "user-agent": "MAXBotWebhook/1.0 (+https://vercel.com)",
+    accept: "image/*,*/*;q=0.8",
+  };
+  const botToken = process.env.MAX_BOT_TOKEN;
+  if (botToken) {
+    headers.authorization = botToken;
+  }
+  return headers;
+}
+
+async function fetchImageBytes(url) {
+  const response = await fetch(url, {
+    headers: getImageFetchHeaders(),
+    redirect: "follow",
+  });
+  if (!response.ok) {
+    return { ok: false, error: `image_fetch_${response.status}`, status: response.status };
+  }
+  const imageBytes = await response.arrayBuffer();
+  const contentType = response.headers.get("content-type") || "";
+  return {
+    ok: true,
+    bytes: new Uint8Array(imageBytes),
+    contentType,
+    size: imageBytes.byteLength,
+  };
+}
+
+async function downloadImageFromAttachment(payload) {
+  const urls = buildImageFetchUrls(payload);
+  let lastError = "image_fetch_no_url";
+
+  for (const url of urls) {
+    try {
+      const fetched = await fetchImageBytes(url);
+      if (!fetched.ok) {
+        lastError = fetched.error;
+        continue;
+      }
+      if (!fetched.size) {
+        lastError = "image_empty";
+        continue;
+      }
+      return fetched;
+    } catch (error) {
+      lastError = `image_fetch_error:${error?.message || error}`;
+    }
+  }
+
+  return { ok: false, error: lastError };
+}
+
+function makeDecodeFailedMarker(reason) {
+  if (!reason) {
+    return DECODE_FAILED_MARKER;
+  }
+  return `${DECODE_FAILED_MARKER}:${reason}`;
+}
+
+function normalizeBarcodeFormat(format) {
+  return String(format || "")
+    .toLowerCase()
+    .replace(/[\s_-]+/g, "");
+}
+
+async function decodeImageFromAttachment(payload) {
+  const downloaded = await downloadImageFromAttachment(payload);
+  if (!downloaded.ok) {
+    return { ok: false, error: downloaded.error };
+  }
+
   const { decodeBuffer } = await import("./_lib/zxing-decode.mjs");
-  return decodeBuffer(new Uint8Array(imageBytes), { contentType });
+  return decodeBuffer(downloaded.bytes, { contentType: downloaded.contentType });
 }
 
 async function enrichPhotoMessages(bodyObj) {
   const updates = getUpdateList(bodyObj);
   for (const update of updates) {
-    if (update?.update_type !== "message_created") {
-      continue;
-    }
-    if (!isEmptyMessageText(update)) {
+    if (!shouldDecodePhotoMessage(update)) {
       continue;
     }
     const payload = getImageAttachment(update);
@@ -160,17 +271,32 @@ async function enrichPhotoMessages(bodyObj) {
     try {
       const decoded = await decodeImageFromAttachment(payload);
       if (decoded?.ok && decoded.text) {
-        const format = String(decoded?.format || "").toLowerCase();
+        const format = normalizeBarcodeFormat(decoded?.format);
         if (format === "datamatrix") {
           update.message.body.text = decoded.text;
+          console.info("max-webhook decode ok", {
+            ms: decoded.ms,
+            wasm: decoded.wasm,
+            size: decoded.text.length,
+          });
         } else {
           update.message.body.text = `${DECODE_NON_DM_PREFIX}${format || "unknown"}`;
+          console.info("max-webhook decode non-dm", { format: decoded.format, ms: decoded.ms });
         }
       } else {
-        update.message.body.text = DECODE_FAILED_MARKER;
+        const reason = decoded?.error || "decode_failed";
+        update.message.body.text = makeDecodeFailedMarker(reason);
+        console.error("max-webhook decode failed", {
+          reason,
+          ms: decoded?.ms,
+          wasm: decoded?.wasm,
+          count: decoded?.count,
+        });
       }
-    } catch {
-      update.message.body.text = DECODE_FAILED_MARKER;
+    } catch (error) {
+      const reason = `decode_exception:${error?.message || error}`;
+      update.message.body.text = makeDecodeFailedMarker(reason);
+      console.error("max-webhook decode exception", reason);
     }
   }
   return bodyObj;
@@ -187,6 +313,7 @@ module.exports = async (req, res) => {
         process.env.ONEC_WEBHOOK_USER && process.env.ONEC_WEBHOOK_PASSWORD
       ),
       max_secret_enabled: Boolean(process.env.MAX_WEBHOOK_SECRET),
+      max_bot_token_set: Boolean(process.env.MAX_BOT_TOKEN),
       proxy_secret_set: Boolean(process.env.ONEC_PROXY_SECRET),
     });
     return;
