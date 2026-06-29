@@ -112,6 +112,46 @@ function isDecodeMarkerText(text) {
   );
 }
 
+function isLikelyBarcodeText(text) {
+  const value = String(text || "").trim();
+  if (value.length < 4) {
+    return false;
+  }
+  if (value.startsWith("]d") || value.startsWith("(")) {
+    return true;
+  }
+  if (/^00\d{18,}$/.test(value) || /^01\d{14}/.test(value)) {
+    return true;
+  }
+  if (/^\d{8,}$/.test(value)) {
+    return true;
+  }
+  return /^[\x20-\x7E]+$/.test(value) && value.length >= 8;
+}
+
+function looksLikeMaxNativeBarcodeText(text) {
+  const value = String(text || "").trim();
+  if (!value || value.length < 8 || isDecodeMarkerText(value)) {
+    return false;
+  }
+  if (isLikelyBarcodeText(value)) {
+    return false;
+  }
+  return /^[A-Za-z0-9+/]+=*$/.test(value);
+}
+
+function tryDecodeMaxNativeText(text) {
+  if (!looksLikeMaxNativeBarcodeText(text)) {
+    return null;
+  }
+  try {
+    const decoded = Buffer.from(String(text).trim(), "base64").toString("utf8");
+    return isLikelyBarcodeText(decoded) ? decoded : null;
+  } catch {
+    return null;
+  }
+}
+
 function shouldDecodePhotoMessage(update) {
   if (update?.update_type !== "message_created") {
     return false;
@@ -123,7 +163,10 @@ function shouldDecodePhotoMessage(update) {
   if (typeof text !== "string" || text.trim() === "") {
     return true;
   }
-  return isDecodeMarkerText(text);
+  if (isDecodeMarkerText(text)) {
+    return true;
+  }
+  return looksLikeMaxNativeBarcodeText(text);
 }
 
 function getImageAttachment(update) {
@@ -261,11 +304,20 @@ async function decodeImageFromAttachment(payload) {
 async function enrichPhotoMessages(bodyObj) {
   const updates = getUpdateList(bodyObj);
   for (const update of updates) {
-    if (!shouldDecodePhotoMessage(update)) {
-      continue;
-    }
     const payload = getImageAttachment(update);
     if (!payload) {
+      continue;
+    }
+
+    const currentText = update?.message?.body?.text;
+    const fromBase64 = tryDecodeMaxNativeText(currentText);
+    if (fromBase64) {
+      update.message.body.text = fromBase64;
+      console.info("max-webhook decode base64 ok", { size: fromBase64.length });
+      continue;
+    }
+
+    if (!shouldDecodePhotoMessage(update)) {
       continue;
     }
     try {
